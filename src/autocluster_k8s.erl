@@ -9,6 +9,8 @@
 
 %% autocluster_backend methods
 -export([nodelist/0,
+         lock/1,
+         unlock/1,
          register/0,
          unregister/0]).
 
@@ -35,6 +37,14 @@ nodelist() ->
 	    {error, Reason}
     end.
 
+
+-spec lock(string()) -> not_supported.
+lock(_) ->
+    not_supported.
+
+-spec unlock(term()) -> ok.
+unlock(_) ->
+    ok.
 
 %% @spec register() -> ok|{error, Reason :: string()}
 %% @doc Stub, since this module does not update DNS

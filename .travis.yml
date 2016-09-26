@@ -3,6 +3,10 @@ language: erlang
 otp_release:
   - 17.5
 
+env:
+  - PROPER_ONLY=true
+  - PROPER_ONLY=false
+
 addons:
   apt:
     packages:
@@ -16,7 +20,6 @@ cache:
     - $HOME/.cache/bin
 
 install:
-  - pip install --user codecov
   - export PATH=$PATH:$HOME/.local/bin
 
 before_script:
@@ -34,30 +37,49 @@ before_script:
 
 script:
   - make RABBITMQ_CURRENT_FETCH_URL=https://github.com/rabbitmq/rabbitmq-trick-erlang.mk-into-using-proper-url-for-deps
-  - make ct COVER=true
   - |
-    # We want this after ct run, so `rabbit` dependency will be fetched.
+    function ensure_plt() {
+    # We want this to happen after ct run, so `rabbit` dependency will be fetched.
     # Then we can add rabbit/rabbit_common to plt, thus getting 0
     # warnings after running dialyzer itself
 
-    # Try to use cached plt if it's valid
-    if [ -r $HOME/.cache/plt/.autocluster.plt ]; then
-      cp -va $HOME/.cache/plt/.autocluster.plt .
-      # Cached PLT can become invalid (i.e. reference some renamed/deleted .beam)
-      dialyzer --check_plt --plt ./.autocluster.plt || rm -f ./.autocluster.plt
-    fi
+        # Try to use cached plt if it's valid
+        if [ -r $HOME/.cache/plt/.autocluster.plt ]; then
+          cp -va $HOME/.cache/plt/.autocluster.plt .
+          # Cached PLT can become invalid (i.e. reference some renamed/deleted .beam)
+          dialyzer --check_plt --plt ./.autocluster.plt || rm -f ./.autocluster.plt
+        fi
 
-    # Build PLT from scratch if there is no cached copy
-    if [ ! -f ./.autocluster.plt ]; then
-      make plt || true # making plt produces some warnings which we don't care about
-      mkdir -p $HOME/.cache/plt/
-      cp -va .autocluster.plt $HOME/.cache/plt/
-    fi
-  - make dialyze
+        # Build PLT from scratch if there is no cached copy
+        if [ ! -f ./.autocluster.plt ]; then
+          make plt || true # making plt produces some warnings which we don't care about
+          mkdir -p $HOME/.cache/plt/
+          cp -va .autocluster.plt $HOME/.cache/plt/
+        fi
+    }
 
-after_success:
-  - ./bin/covertool -cover ct.coverdata -appname autocluster
-  - codecov -f coverage.xml -X search
+    function upload_logs() {
+      tar cjvf logs.tar.bz2 logs/
+      echo Uploading logs for further investigation to:
+      curl -sST logs.tar.bz2 chunk.io
+    }
+
+    case "$PROPER_ONLY" in
+        true)
+            if ! make ct CT_SUITES=etcd; then
+                upload_logs
+                exit 1
+            fi
+            ;;
+        *)
+            pip install --user codecov
+            make ct COVER=true
+            ensure_plt
+            make dialyze
+            ./bin/covertool -cover ct.coverdata -appname autocluster
+            codecov -f coverage.xml -X search
+            ;;
+    esac
 
 before_deploy:
   - make clean
