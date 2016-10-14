@@ -46,6 +46,9 @@
 
 -include("autocluster.hrl").
 
+%% For performing checks via `rabbitmqctl eval`
+-export([cluster_health_check/0]).
+
 %% Export all for unit tests
 -ifdef(TEST).
 -compile(export_all).
@@ -419,15 +422,10 @@ start_dependee_applications() ->
 %%--------------------------------------------------------------------
 -spec choose_best_node([#augmented_node{}]) -> node() | undefined.
 choose_best_node([_|_] = NonEmptyNodeList) ->
-    Sorted = lists:sort(fun(#augmented_node{name = A}, #augmented_node{name = B}) ->
-                                A < B
-                        end,
-                        NonEmptyNodeList),
-    WithoutSelfAndDead = lists:filter(fun (#augmented_node{name = Node}) when Node =:= node() -> false;
-                                          (#augmented_node{alive = false}) -> false;
-                                          (_) -> true
-                                      end, Sorted),
-    case WithoutSelfAndDead of
+    OtherLiveNodes = sort_live_nodes(
+                       remove_this_node(
+                         remove_dead_nodes(NonEmptyNodeList))),
+    case OtherLiveNodes of
         [BestNode|_] ->
             BestNode#augmented_node.name;
         _ ->
@@ -543,3 +541,162 @@ with_stopped_app(Fun) ->
     ensure_app_stopped(),
     Fun(),
     ensure_app_running().
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Startup Locking Helpers
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Runs specified function with the protection of startup lock,
+%% ensuring correct cleanup in case of errors.
+%% @end
+%%--------------------------------------------------------------------
+-spec with_startup_lock(fun (() -> term())) -> term().
+with_startup_lock(Fun) ->
+    {ok, _, Mod} = detect_backend(autocluster_config:get(backend)),
+    LockData = case Mod:lock(atom_to_list(node())) of
+                   ok -> undefined;
+                   not_supported -> undefined;
+                   {ok, Something} -> Something
+               end,
+    Parent = self(),
+    LockMonitor = spawn(fun () -> off_process_unlocker(Mod, Parent, LockData) end),
+    try
+        Fun()
+    after
+        stop_unlocker(LockMonitor)
+    end.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Separate process responsible for releasing startup lock. With
+%% separate process we can be sure that the lock will be released even
+%% when calling process was killed.
+%% @end
+%%--------------------------------------------------------------------
+-spec off_process_unlocker(module(), pid(), term()) -> ok.
+off_process_unlocker(Mod, Parent, LockData) ->
+    MRef = monitor(process, Parent),
+    receive
+        {'DOWN', MRef, _, _, _} ->
+            ok;
+        release ->
+            ok
+    end,
+    Mod:unlock(LockData),
+    ok.
+
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Graceful termination of process defined by off_process_unlocker/3
+%% @end
+%%--------------------------------------------------------------------
+-spec stop_unlocker(pid()) -> ok.
+stop_unlocker(LockMonitor) ->
+    LockMonitor ! release,
+    MRef = monitor(process, LockMonitor),
+    receive
+        {'DOWN', MRef, _, _, _} ->
+            ok
+    end.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Cluster Health Check
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%%--------------------------------------------------------------------
+%% @doc
+%% Prints cluster health report to current group leader, allowing us
+%% to use it from external monitoring scripts via `rabbitmqctl eval`.
+%% Reports starts with either "FAILURE: " or "SUCCESS: ".
+%% @end
+%%--------------------------------------------------------------------
+-spec cluster_health_check() -> ok.
+cluster_health_check() ->
+    io:format("~s~n", [cluster_health_check_report()]).
+
+-spec cluster_health_check_report() -> string().
+cluster_health_check_report() ->
+    ThisNode = node(),
+    case whom_we_should_be_clustered_with() of
+        undefined ->
+            report_failure("Unexpected, we should at least see ourselves as discovery node", []);
+        #augmented_node{name = ThisNode} ->
+            report_success("We are best discovery node in the cluster", []);
+        SomeOtherNode ->
+            cluster_health_check_report(SomeOtherNode)
+    end.
+
+-spec cluster_health_check_report(#augmented_node{}) -> string().
+cluster_health_check_report(DiscoveryNode) ->
+    DiscoveryName = DiscoveryNode#augmented_node.name,
+    ThisNode = autocluster_util:augmented_node_info(),
+    RemoteViolated = not is_clustering_consistent(DiscoveryNode, ThisNode),
+    LocalViolated = not is_clustering_consistent(ThisNode, DiscoveryNode),
+    case {RemoteViolated, LocalViolated} of
+        {true, true} ->
+            report_failure("We and discovery node ~p see each other as inconsistent",
+                           [DiscoveryName]);
+        {true, _} ->
+            report_failure("Discovery node ~p thinks that we are not properly clustered with it",
+                           [DiscoveryName]);
+        {_, true} ->
+            report_failure("We are not properly clustered with discovery node ~p",
+                           [DiscoveryName]);
+        _ ->
+            report_success("Everything is OK", [])
+    end.
+
+-spec report_failure(string(), [term()]) -> string().
+report_failure(Fmt, Args) ->
+    lists:flatten(io_lib:format("FAILURE: ~s",
+                                [io_lib:format(Fmt, Args)])).
+
+-spec report_success(string(), [term()]) -> string().
+report_success(Fmt, Args) ->
+    lists:flatten(io_lib:format("SUCCESS: ~s",
+                                [io_lib:format(Fmt, Args)])).
+
+-spec is_clustering_consistent(#augmented_node{}, #augmented_node{}) -> boolean().
+is_clustering_consistent(#augmented_node{alive_cluster_nodes = Alive}, OtherNode) ->
+    lists:member(OtherNode#augmented_node.name, Alive).
+
+-spec remove_dead_nodes([#augmented_node{}]) -> [#augmented_node{}].
+remove_dead_nodes(Nodes) ->
+    lists:filter(fun (#augmented_node{alive = false}) -> false;
+                     (_) -> true
+                 end, Nodes).
+
+-spec remove_this_node([#augmented_node{}]) -> [#augmented_node{}].
+remove_this_node(Nodes) ->
+    lists:filter(
+      fun (#augmented_node{name = Node}) when Node =:= node() -> false;
+          (_) -> true
+      end, Nodes).
+
+-spec sort_live_nodes([#augmented_node{}]) -> [#augmented_node{}].
+sort_live_nodes(Nodes) ->
+    lists:sort(fun(#augmented_node{name = A}, #augmented_node{name = B}) ->
+                       A < B
+               end,
+               Nodes).
+
+-spec whom_we_should_be_clustered_with() -> #augmented_node{} | undefined.
+whom_we_should_be_clustered_with() ->
+    with_startup_lock(
+      fun() ->
+              {ok, _, Mod} = detect_backend(autocluster_config:get(backend)),
+              {ok, Nodes} = Mod:nodelist(),
+              ANodes = autocluster_util:augment_nodelist(Nodes),
+              case sort_live_nodes(remove_dead_nodes(ANodes)) of
+                  [SomeNode|_] ->
+                      SomeNode;
+                  _ ->
+                      undefined
+              end
+      end).

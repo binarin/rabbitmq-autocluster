@@ -236,6 +236,91 @@ choose_best_node_empty_list_test() ->
 choose_best_node_only_self_test() ->
     ?assertEqual(undefined, autocluster:choose_best_node([#augmented_node{name = node()}])).
 
+with_lock_wraps_lock_around_function_call_test_() ->
+    autocluster_testing:with_mock(
+      [autocluster_etcd],
+      fun () ->
+              os:putenv("AUTOCLUSTER_TYPE", "etcd"),
+              meck:expect(autocluster_etcd, lock, fun (_) -> {ok, unique_smth} end),
+              meck:expect(autocluster_etcd, unlock, fun (unique_smth) -> ok end),
+              Fun = fun () -> fun_result end,
+              case autocluster:with_startup_lock(Fun) of
+                  Got -> ?assertEqual(Got, fun_result)
+              end,
+              ?assert(meck:called(autocluster_etcd, lock, '_')),
+              ?assert(meck:called(autocluster_etcd, unlock, '_')),
+              ok
+      end).
+
+with_lock_releases_lock_on_exit_test_() ->
+    autocluster_testing:with_mock(
+      [autocluster_etcd],
+      fun () ->
+              os:putenv("AUTOCLUSTER_TYPE", "etcd"),
+              Parent = self(),
+              meck:expect(autocluster_etcd, lock, fun (_) -> {ok, unique_smth} end),
+              meck:expect(autocluster_etcd, unlock, fun (unique_smth) -> Parent ! released end),
+              Fun = fun () -> exit(ho) end,
+              ?assertExit(ho, autocluster:with_startup_lock(Fun)),
+              receive
+                  released -> ok
+              after
+                  500 -> exit(lock_was_not_released)
+              end,
+              ok
+      end).
+
+cluster_health_check_test_() ->
+    Other = 'aaaaaa_first_alphabetically@node',
+    ThisNodeStandalone = #augmented_node{name = node(),
+                                         alive = true,
+                                         alive_cluster_nodes = [node()]},
+    ThisNodeClustered = #augmented_node{name = node(),
+                                        alive = true,
+                                        alive_cluster_nodes = [node(), Other]},
+    OtherNodeStandalone = #augmented_node{name = Other,
+                                          alive = true,
+                                          alive_cluster_nodes = [Other]},
+    OtherNodeClustered = #augmented_node{name = Other,
+                                         alive = true,
+                                         alive_cluster_nodes = [node(), Other]},
+
+    Cases = [{standalone,
+              ThisNodeStandalone, [ThisNodeStandalone], "SUCCESS"},
+             {we_are_not_in_the_backend,
+              ThisNodeStandalone, [], "FAILURE"},
+             {ok,
+              ThisNodeClustered, [ThisNodeClustered, OtherNodeClustered], "SUCCESS"},
+             {discovery_node_doesnt_know_us,
+              ThisNodeClustered, [ThisNodeClustered, OtherNodeStandalone], "FAILURE"},
+             {discovery_node_knows_us_but_not_vice_versa,
+               ThisNodeStandalone, [ThisNodeStandalone, OtherNodeClustered], "FAILURE"},
+             {completely_separated_from_discovery_node,
+               ThisNodeStandalone, [ThisNodeStandalone, OtherNodeStandalone], "FAILURE"}],
+
+    autocluster_testing:with_mock_each(
+      [autocluster_etcd,
+       {autocluster_util, [passthrough]}],
+      [{eunit_title("Case ~p for cluster_health_check_report/0", [Name]),
+        fun() ->
+                os:putenv("AUTOCLUSTER_TYPE", "etcd"),
+                meck:expect(autocluster_etcd, lock, fun(_) -> ok end),
+                meck:expect(autocluster_etcd, unlock, fun(_) -> ok end),
+                meck:expect(autocluster_etcd, nodelist, fun() -> {ok, []} end),
+
+                meck:expect(autocluster_util, augmented_node_info, fun() -> ThisNode end),
+                meck:expect(autocluster_util, augment_nodelist, fun (_) -> AugmentedNodes end),
+                Report = autocluster:cluster_health_check_report(),
+                case re:run(Report, Expected, []) of
+                    {match, _} ->
+                        ok;
+                    _ ->
+                        exit({unexpected_report, Report})
+                end,
+                ok
+        end} || {Name, ThisNode, AugmentedNodes, Expected} <- Cases]).
+
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% Helpers
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
