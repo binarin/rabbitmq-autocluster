@@ -37,8 +37,7 @@ before_script:
 script:
   - make RABBITMQ_CURRENT_FETCH_URL=https://github.com/rabbitmq/rabbitmq-trick-erlang.mk-into-using-proper-url-for-deps
   - |
-    set -euo pipefail
-    set -x
+    set -exo pipefail
     function ensure_plt() {
     # We want this to happen after ct run, so `rabbit` dependency will be fetched.
     # Then we can add rabbit/rabbit_common to plt, thus getting 0
@@ -90,7 +89,7 @@ script:
             codecov -f coverage.xml -X search
             ;;
     esac
-    set +e
+    set +exo pipefail
 
 before_deploy:
   - make clean
