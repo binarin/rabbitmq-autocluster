@@ -80,7 +80,10 @@ script:
             ;;
         *)
             pip install --user codecov
-            make ct COVER=true
+            if ! make test-build ct COVER=true IS_APP=1; then
+                upload_logs
+                exit 1
+            fi
             ensure_plt
             make dialyze
             ./bin/covertool -cover ct.coverdata -appname autocluster
