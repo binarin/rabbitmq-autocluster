@@ -90,6 +90,7 @@ script:
             codecov -f coverage.xml -X search
             ;;
     esac
+    set +e
 
 before_deploy:
   - make clean
